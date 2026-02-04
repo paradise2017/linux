@@ -534,7 +534,9 @@ struct sock {
 	unsigned long	        sk_lingertime;
 	struct proto		*sk_prot_creator;
 	rwlock_t		sk_callback_lock;
+// 当前ack回传队列长度
 	u32			sk_ack_backlog;
+// 最大ack回传队列长度
 	u32			sk_max_ack_backlog;
 	unsigned long		sk_ino;
 	spinlock_t		sk_peer_lock;

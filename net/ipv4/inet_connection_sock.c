@@ -1311,38 +1311,64 @@ static int inet_ulp_can_listen(const struct sock *sk)
 	return 0;
 }
 
+/*
+ * inet_csk_listen_start - 启动TCP连接socket的监听过程
+ * @sk: 要启动监听的sock结构体指针
+ * 
+ * 这个函数是TCP连接socket监听的核心实现，主要完成以下任务：
+ * 1. 检查ULP（Upper Layer Protocol）是否允许监听
+ * 2. 分配连接请求队列（accept queue）
+ * 3. 初始化ACK backlog和延迟ACK机制
+ * 4. 将socket状态设置为TCP_LISTEN
+ * 5. 获取并验证端口号
+ * 6. 将socket添加到协议哈希表中
+ * 
+ * 注意：存在一个竞态窗口，socket在端口验证完成前就宣布进入监听状态，
+ * 但这是安全的，因为socket只有在验证完成后才会加入哈希表。
+ * 
+ * 返回值: 成功返回0，失败返回错误码
+ */
 int inet_csk_listen_start(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct inet_sock *inet = inet_sk(sk);
 	int err;
 
+	/* 检查上层协议（如TLS）是否允许该socket进行监听 */
 	err = inet_ulp_can_listen(sk);
 	if (unlikely(err))
 		return err;
 
+	/* 分配连接请求队列，用于存储待处理的连接请求 */
 	reqsk_queue_alloc(&icsk->icsk_accept_queue);
 
+	/* 初始化ACK backlog计数器和延迟ACK机制 */
 	sk->sk_ack_backlog = 0;
 	inet_csk_delack_init(sk);
 
-	/* There is race window here: we announce ourselves listening,
-	 * but this transition is still not validated by get_port().
-	 * It is OK, because this socket enters to hash table only
-	 * after validation is complete.
+	/* 
+	 * 存在竞态窗口：我们先将socket状态设置为监听状态，
+	 * 但这个状态转换还没有通过get_port()验证。
+	 * 这是安全的，因为socket只有在验证完成后才会加入哈希表。
 	 */
 	inet_sk_state_store(sk, TCP_LISTEN);
+	
+	/* 获取并验证端口号（检查端口是否可用） */
 	err = sk->sk_prot->get_port(sk, inet->inet_num);
 	if (!err) {
+		/* 设置源端口号（网络字节序） */
 		inet->inet_sport = htons(inet->inet_num);
 
+		/* 重置路由缓存，确保使用最新的路由信息 */
 		sk_dst_reset(sk);
+		/* 将socket添加到协议哈希表中，使其可被接收连接 */
 		err = sk->sk_prot->hash(sk);
 
 		if (likely(!err))
 			return 0;
 	}
 
+	/* 如果任何步骤失败，将socket状态恢复为TCP_CLOSE */
 	inet_sk_set_state(sk, TCP_CLOSE);
 	return err;
 }

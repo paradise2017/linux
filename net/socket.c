@@ -1997,15 +1997,31 @@ SYSCALL_DEFINE3(bind, int, fd, struct sockaddr __user *, umyaddr, int, addrlen)
  *	necessary for a listen, and if that works, we mark the socket as
  *	ready for listening.
  */
+/*
+ * __sys_listen_socket - 实现socket监听的核心函数
+ * @sock: 要监听的socket结构体指针
+ * @backlog: 最大连接队列长度
+ * 
+ * 这个函数执行socket的监听操作，主要完成以下任务：
+ * 1. 检查并限制backlog不超过系统最大连接数限制(somaxconn)
+ * 2. 调用安全模块进行权限检查
+ * 3. 调用协议特定的listen操作
+ * 
+ * 返回值: 成功返回0，失败返回错误码
+ */
 int __sys_listen_socket(struct socket *sock, int backlog)
 {
 	int somaxconn, err;
 
+	/* 获取系统允许的最大连接队列长度 */
 	somaxconn = READ_ONCE(sock_net(sock->sk)->core.sysctl_somaxconn);
+	/* 如果请求的backlog超过系统限制，则使用系统限制值 */
 	if ((unsigned int)backlog > somaxconn)
 		backlog = somaxconn;
 
+	/* 调用LSM(Linux Security Module)进行安全权限检查 */
 	err = security_socket_listen(sock, backlog);
+	/* 如果安全检查通过，调用协议特定的listen实现 */
 	if (!err)
 		err = READ_ONCE(sock->ops)->listen(sock, backlog);
 	return err;

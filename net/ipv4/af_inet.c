@@ -191,37 +191,56 @@ static int inet_autobind(struct sock *sk)
 	return 0;
 }
 
+/*
+ * __inet_listen_sk - IPv4协议栈中实现TCP socket监听的核心函数
+ * @sk: 要监听的sock结构体指针
+ * @backlog: 最大连接队列长度
+ * 
+ * 这个函数负责将TCP socket置于监听状态，主要功能包括：
+ * 1. 检查socket状态是否允许监听（必须是CLOSE或LISTEN状态）
+ * 2. 设置最大连接队列长度
+ * 3. 如果socket尚未处于LISTEN状态，则启动监听过程
+ * 4. 配置TCP Fast Open功能（如果系统支持）
+ * 5. 调用BPF钩子函数
+ * 
+ * 返回值: 成功返回0，失败返回错误码
+ */
 int __inet_listen_sk(struct sock *sk, int backlog)
 {
 	unsigned char old_state = sk->sk_state;
 	int err, tcp_fastopen;
 
+	/* 检查socket状态：只有CLOSE或LISTEN状态的socket才能进行监听操作 */
 	if (!((1 << old_state) & (TCPF_CLOSE | TCPF_LISTEN)))
 		return -EINVAL;
 
+	/* 设置最大连接队列长度 */
 	WRITE_ONCE(sk->sk_max_ack_backlog, backlog);
-	/* Really, if the socket is already in listen state
-	 * we can only allow the backlog to be adjusted.
-	 */
+	
+	/* 如果socket已经处于LISTEN状态，我们只能调整backlog参数 */
 	if (old_state != TCP_LISTEN) {
-		/* Enable TFO w/o requiring TCP_FASTOPEN socket option.
-		 * Note that only TCP sockets (SOCK_STREAM) will reach here.
-		 * Also fastopen backlog may already been set via the option
-		 * because the socket was in TCP_LISTEN state previously but
-		 * was shutdown() rather than close().
+		/* 
+		 * 启用TCP Fast Open功能，无需设置TCP_FASTOPEN socket选项
+		 * 注意：只有TCP socket（SOCK_STREAM）才会执行到这里
+		 * 另外，fastopen backlog可能已经通过选项设置过，因为socket
+		 * 之前可能处于TCP_LISTEN状态但被shutdown()而不是close()
 		 */
 		tcp_fastopen = READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_fastopen);
+		/* 检查系统是否支持TFO且未设置过fastopen队列 */
 		if ((tcp_fastopen & TFO_SERVER_WO_SOCKOPT1) &&
 		    (tcp_fastopen & TFO_SERVER_ENABLE) &&
 		    !inet_csk(sk)->icsk_accept_queue.fastopenq.max_qlen) {
+			/* 配置fastopen队列参数并初始化TFO密钥 */
 			fastopen_queue_tune(sk, backlog);
 			tcp_fastopen_init_key_once(sock_net(sk));
 		}
 
+		/* 启动TCP监听过程 */
 		err = inet_csk_listen_start(sk);
 		if (err)
 			return err;
 
+		/* 调用BPF钩子函数，通知监听事件 */
 		tcp_call_bpf(sk, BPF_SOCK_OPS_TCP_LISTEN_CB, 0, NULL);
 	}
 	return 0;
