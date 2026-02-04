@@ -443,6 +443,22 @@ static inline void list_splice_tail_init_rcu(struct list_head *list,
  * the _rcu list-mutation primitives such as list_add_rcu()
  * as long as the traversal is guarded by rcu_read_lock().
  */
+/*
+ * list_for_each_entry_rcu - 在RCU保护下遍历链表中的条目
+ * @pos: 用作循环游标的类型指针
+ * @head: 链表的头节点
+ * @member: 结构体中list_head成员的名称
+ * @cond: 可选的lockdep表达式，如果从非RCU保护区域调用时需要
+ * 
+ * 这个链表遍历原语可以安全地与_rcu链表修改原语（如list_add_rcu()）并发运行，
+ * 只要遍历操作在rcu_read_lock()的保护下进行。
+ * 
+ * 实现原理：
+ * 1. 使用__list_check_rcu进行RCU保护检查
+ * 2. 通过list_entry_rcu宏从链表节点获取包含的结构体指针
+ * 3. 使用RCU安全的指针解引用方式遍历链表
+ * 4. 确保在遍历过程中链表结构不会被破坏
+ */
 #define list_for_each_entry_rcu(pos, head, member, cond...)		\
 	for (__list_check_rcu(dummy, ## cond, 0),			\
 	     pos = list_entry_rcu((head)->next, typeof(*pos), member);	\

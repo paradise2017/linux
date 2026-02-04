@@ -75,22 +75,28 @@ struct net_offload {
 /* This should be set for any extension header which is compatible with GSO. */
 #define INET6_PROTO_GSO_EXTHDR	0x1
 
-/* This is used to register socket interfaces for IP protocols.  */
+/*
+ * inet_protosw - 用于注册IP协议套接字接口的结构体
+ * 
+ * 该结构体定义了IP协议族中特定协议的处理程序接口，
+ * 用于在套接字创建时查找对应的协议实现
+ */ 
 struct inet_protosw {
-	struct list_head list;
+	struct list_head list;		/* 链表节点，用于将协议处理程序链接到协议表中 */
 
-        /* These two fields form the lookup key.  */
-	unsigned short	 type;	   /* This is the 2nd argument to socket(2). */
-	unsigned short	 protocol; /* This is the L4 protocol number.  */
+        /* 这两个字段构成查找键值 */
+	unsigned short	 type;	   /* 套接字类型，对应socket(2)的第二个参数 (SOCK_STREAM, SOCK_DGRAM等) */
+	unsigned short	 protocol; /* L4协议号 (IPPROTO_TCP, IPPROTO_UDP等) */
 
-	struct proto	 *prot;
-	const struct proto_ops *ops;
+	struct proto	 *prot;		/* 协议特定的操作函数表，包含数据收发等核心功能 */
+	const struct proto_ops *ops;	/* 套接字操作函数表，包含bind、connect、accept等系统调用实现 */
   
-	unsigned char	 flags;      /* See INET_PROTOSW_* below.  */
+	unsigned char	 flags;      /* 协议标志位，参见下面的INET_PROTOSW_*定义 */
 };
-#define INET_PROTOSW_REUSE 0x01	     /* Are ports automatically reusable? */
-#define INET_PROTOSW_PERMANENT 0x02  /* Permanent protocols are unremovable. */
-#define INET_PROTOSW_ICSK      0x04  /* Is this an inet_connection_sock? */
+/* inet_protosw标志位定义 */
+#define INET_PROTOSW_REUSE 0x01	     /* 端口是否自动可重用？ (用于支持SO_REUSEADDR) */
+#define INET_PROTOSW_PERMANENT 0x02  /* 永久协议，不可移除 (如TCP、UDP等核心协议) */
+#define INET_PROTOSW_ICSK      0x04  /* 是否为inet_connection_sock？ (面向连接的协议如TCP) */
 
 extern struct net_protocol __rcu *inet_protos[MAX_INET_PROTOS];
 extern const struct net_offload __rcu *inet_offloads[MAX_INET_PROTOS];

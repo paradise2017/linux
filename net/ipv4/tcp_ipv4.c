@@ -3431,7 +3431,7 @@ bool tcp_stream_memory_free(const struct sock *sk, int wake)
 	return (notsent_bytes << wake) < tcp_notsent_lowat(tp);
 }
 EXPORT_SYMBOL(tcp_stream_memory_free);
-
+// 协议操作函数表
 struct proto tcp_prot = {
 	.name			= "TCP",
 	.owner			= THIS_MODULE,

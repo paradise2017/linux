@@ -127,6 +127,7 @@
 /* The inetsw table contains everything that inet_create needs to
  * build a new socket.
  */
+// 每个元素是一个链表头
 static struct list_head inetsw[SOCK_MAX];
 static DEFINE_SPINLOCK(inetsw_lock);
 
@@ -251,35 +252,52 @@ EXPORT_SYMBOL(inet_listen);
  *	Create an inet socket.
  */
 
+/*
+ * inet_create - IPv4协议族的套接字创建函数
+ * @net: 网络命名空间
+ * @sock: 套接字结构体指针
+ * @protocol: 协议类型 (IPPROTO_TCP, IPPROTO_UDP等)
+ * @kern: 是否为内核空间套接字
+ * 
+ * 返回值: 成功返回0，失败返回错误码
+ * 
+ * 该函数是IPv4协议族的核心创建函数，负责查找合适的协议处理程序、
+ * 分配套接字结构体、初始化套接字参数等
+ */
 static int inet_create(struct net *net, struct socket *sock, int protocol,
 		       int kern)
 {
 	struct sock *sk;
-	struct inet_protosw *answer;
-	struct inet_sock *inet;
-	struct proto *answer_prot;
-	unsigned char answer_flags;
-	int try_loading_module = 0;
+	struct inet_protosw *answer;	/* 找到的协议处理程序 */
+	struct inet_sock *inet;		/* IPv4特定的套接字信息 */
+	struct proto *answer_prot;	/* 协议操作函数表 */
+	unsigned char answer_flags;	/* 协议标志位 */
+	int try_loading_module = 0;	/* 模块加载尝试次数 */
 	int err;
 
+	/* 检查协议号是否在有效范围内 */
 	if (protocol < 0 || protocol >= IPPROTO_MAX)
 		return -EINVAL;
 
-	sock->state = SS_UNCONNECTED;
+	sock->state = SS_UNCONNECTED;	/* 设置套接字状态为未连接 */
 
-	/* Look for the requested type/protocol pair. */
+	/* 查找请求的类型/协议对 */
 lookup_protocol:
 	err = -ESOCKTNOSUPPORT;
 	rcu_read_lock();
+	/* 在协议处理程序链表中查找匹配的协议 */
+	// list代表answer (struct list_head)中需要查找的list;
+	// inetsw链表头，得到每一个链表的节点，指针--得到struct inet_protosw *answer;
+	//  遍历inetsw数组，查找匹配的协议处理程序
 	list_for_each_entry_rcu(answer, &inetsw[sock->type], list) {
 
 		err = 0;
-		/* Check the non-wild match. */
+		/* 检查精确匹配 */
 		if (protocol == answer->protocol) {
 			if (protocol != IPPROTO_IP)
 				break;
 		} else {
-			/* Check for the two wild cases. */
+			/* 检查两种通配符情况 */
 			if (IPPROTO_IP == protocol) {
 				protocol = answer->protocol;
 				break;
@@ -291,40 +309,48 @@ lookup_protocol:
 	}
 
 	if (unlikely(err)) {
+		/* 如果找不到协议处理程序，尝试加载模块 */
 		if (try_loading_module < 2) {
 			rcu_read_unlock();
 			/*
-			 * Be more specific, e.g. net-pf-2-proto-132-type-1
+			 * 第一次尝试：加载特定类型的模块
+			 * 例如：net-pf-2-proto-132-type-1
 			 * (net-pf-PF_INET-proto-IPPROTO_SCTP-type-SOCK_STREAM)
 			 */
 			if (++try_loading_module == 1)
 				request_module("net-pf-%d-proto-%d-type-%d",
 					       PF_INET, protocol, sock->type);
 			/*
-			 * Fall back to generic, e.g. net-pf-2-proto-132
+			 * 第二次尝试：回退到通用模块
+			 * 例如：net-pf-2-proto-132
 			 * (net-pf-PF_INET-proto-IPPROTO_SCTP)
 			 */
 			else
 				request_module("net-pf-%d-proto-%d",
 					       PF_INET, protocol);
-			goto lookup_protocol;
+			goto lookup_protocol;	/* 重新尝试查找协议 */
 		} else
-			goto out_rcu_unlock;
+			goto out_rcu_unlock;	/* 两次尝试都失败，返回错误 */
 	}
 
+	/* RAW套接字权限检查：非内核空间需要CAP_NET_RAW权限 */
 	err = -EPERM;
 	if (sock->type == SOCK_RAW && !kern &&
 	    !ns_capable(net->user_ns, CAP_NET_RAW))
 		goto out_rcu_unlock;
-
+	// 对应 inet_protosw inetsw_array 数组中的元素
+	/* 设置套接字操作函数表 */
 	sock->ops = answer->ops;
-	answer_prot = answer->prot;
-	answer_flags = answer->flags;
+	answer_prot = answer->prot;	/* 协议操作函数表 */
+	answer_flags = answer->flags;	/* 协议标志位 */
 	rcu_read_unlock();
 
+	/* 确保协议有有效的slab缓存 */
 	WARN_ON(!answer_prot->slab);
 
+	/* 分配套接字结构体 */
 	err = -ENOMEM;
+	// sk_alloc 分配套接字结构体，链接底层
 	sk = sk_alloc(net, PF_INET, GFP_KERNEL, answer_prot, kern);
 	if (!sk)
 		goto out;
@@ -354,40 +380,43 @@ lookup_protocol:
 
 	atomic_set(&inet->inet_id, 0);
 
+	/* 初始化套接字数据 */
 	sock_init_data(sock, sk);
 
-	sk->sk_destruct	   = inet_sock_destruct;
-	sk->sk_protocol	   = protocol;
-	sk->sk_backlog_rcv = sk->sk_prot->backlog_rcv;
-	sk->sk_txrehash = READ_ONCE(net->core.sysctl_txrehash);
+	sk->sk_destruct	   = inet_sock_destruct;	/* 设置套接字销毁函数 */
+	sk->sk_protocol	   = protocol;		/* 设置协议类型 */
+	sk->sk_backlog_rcv = sk->sk_prot->backlog_rcv;	/* 设置积压数据接收函数 */
+	sk->sk_txrehash = READ_ONCE(net->core.sysctl_txrehash);	/* 设置传输重哈希 */
 
-	inet->uc_ttl	= -1;
-	inet_set_bit(MC_LOOP, sk);
-	inet->mc_ttl	= 1;
-	inet_set_bit(MC_ALL, sk);
-	inet->mc_index	= 0;
-	inet->mc_list	= NULL;
-	inet->rcv_tos	= 0;
+	/* 初始化IPv4特定参数 */
+	inet->uc_ttl	= -1;		/* 单播TTL默认值 */
+	inet_set_bit(MC_LOOP, sk);	/* 启用多播回环 */
+	inet->mc_ttl	= 1;		/* 多播TTL默认值 */
+	inet_set_bit(MC_ALL, sk);	/* 接收所有多播数据包 */
+	inet->mc_index	= 0;		/* 多播接口索引 */
+	inet->mc_list	= NULL;		/* 多播组列表 */
+	inet->rcv_tos	= 0;		/* 接收到的TOS值 */
 
 	if (inet->inet_num) {
-		/* It assumes that any protocol which allows
-		 * the user to assign a number at socket
-		 * creation time automatically
-		 * shares.
+		/* 假设任何允许用户在套接字创建时分配端口号的协议
+		 * 都会自动共享该端口号
 		 */
 		inet->inet_sport = htons(inet->inet_num);
-		/* Add to protocol hash chains. */
+		/* 添加到协议哈希链中 */
 		err = sk->sk_prot->hash(sk);
 		if (err)
 			goto out_sk_release;
 	}
 
+	/* 调用协议特定的初始化函数 */
+	// 调用tcp_ipv4.c 中的 tcp_init_sock
 	if (sk->sk_prot->init) {
 		err = sk->sk_prot->init(sk);
 		if (err)
 			goto out_sk_release;
 	}
 
+	/* 用户空间套接字需要运行BPF CGROUP程序 */
 	if (!kern) {
 		err = BPF_CGROUP_RUN_PROG_INET_SOCK(sk);
 		if (err)
@@ -447,6 +476,7 @@ int inet_bind_sk(struct sock *sk, struct sockaddr_unsized *uaddr, int addr_len)
 	int err;
 
 	/* If the socket has its own bind function then use it. (RAW) */
+	// 面向对象在C语言中的体现，如果重写就调用，没有重写就不调用，共用父类功能
 	if (sk->sk_prot->bind) {
 		return sk->sk_prot->bind(sk, uaddr, addr_len);
 	}
@@ -463,17 +493,19 @@ int inet_bind_sk(struct sock *sk, struct sockaddr_unsized *uaddr, int addr_len)
 
 	return __inet_bind(sk, uaddr, addr_len, flags);
 }
-
+// 用户层传入的ip地址和port绑定到内核套接字
 int inet_bind(struct socket *sock, struct sockaddr_unsized *uaddr, int addr_len)
 {
 	return inet_bind_sk(sock->sk, uaddr, addr_len);
 }
 EXPORT_SYMBOL(inet_bind);
-
+// IPv4套接字绑定实现函数
 int __inet_bind(struct sock *sk, struct sockaddr_unsized *uaddr, int addr_len,
 		u32 flags)
 {
+	/* 将通用地址结构转换为 IPv4 专用结构 */
 	struct sockaddr_in *addr = (struct sockaddr_in *)uaddr;
+	/* inet_sock 保存 IPv4 特定的套接字信息 */
 	struct inet_sock *inet = inet_sk(sk);
 	struct net *net = sock_net(sk);
 	unsigned short snum;
@@ -481,68 +513,76 @@ int __inet_bind(struct sock *sk, struct sockaddr_unsized *uaddr, int addr_len,
 	u32 tb_id = RT_TABLE_LOCAL;
 	int err;
 
+	/* 检查传入地址族：期望 AF_INET（或兼容的 AF_UNSPEC/INADDR_ANY） */
 	if (addr->sin_family != AF_INET) {
-		/* Compatibility games : accept AF_UNSPEC (mapped to AF_INET)
-		 * only if s_addr is INADDR_ANY.
-		 */
+		/* 兼容处理：允许 AF_UNSPEC 且地址为 INADDR_ANY */
 		err = -EAFNOSUPPORT;
 		if (addr->sin_family != AF_UNSPEC ||
 		    addr->sin_addr.s_addr != htonl(INADDR_ANY))
 			goto out;
 	}
 
+	/* 根据绑定的设备索引选择 FIB table id（可能被 l3mdev 改写） */
 	tb_id = l3mdev_fib_table_by_index(net, sk->sk_bound_dev_if) ? : tb_id;
+	/* 检查地址类型（本地、广播、多播、非本地等） */
 	chk_addr_ret = inet_addr_type_table(net, addr->sin_addr.s_addr, tb_id);
 
-	/* Not specified by any standard per-se, however it breaks too
-	 * many applications when removed.  It is unfortunate since
-	 * allowing applications to make a non-local bind solves
-	 * several problems with systems using dynamic addressing.
-	 * (ie. your servers still start up even if your ISDN link
-	 *  is temporarily down)
+	/*
+	 * 允许非本地 bind 是历史行为，许多应用依赖此特性；
+	 * 但仍需验证地址是否在允许范围或符合非本地绑定策略。
 	 */
 	err = -EADDRNOTAVAIL;
 	if (!inet_addr_valid_or_nonlocal(net, inet, addr->sin_addr.s_addr,
 	                                 chk_addr_ret))
 		goto out;
 
+	/* 获取主机字节序端口号用于权限检查 */
 	snum = ntohs(addr->sin_port);
+	/* 检查是否有权限绑定特权端口（<1024），除非 flags 指定跳过检查 */
 	err = -EACCES;
 	if (!(flags & BIND_NO_CAP_NET_BIND_SERVICE) &&
 	    snum && inet_port_requires_bind_service(net, snum) &&
 	    !ns_capable(net->user_ns, CAP_NET_BIND_SERVICE))
 		goto out;
 
-	/*      We keep a pair of addresses. rcv_saddr is the one
-	 *      used by hash lookups, and saddr is used for transmit.
+	/*
+	 * 在 BSD 语义下，维护两个地址：
+	 *  - inet_rcv_saddr: 用于 hash 查找（接收）
+	 *  - inet_saddr: 用于发送（transmit）
 	 *
-	 *      In the BSD API these are the same except where it
-	 *      would be illegal to use them (multicast/broadcast) in
-	 *      which case the sending device address is used.
+	 * 当 flags 要求时，为操作加锁以保证并发安全
 	 */
 	if (flags & BIND_WITH_LOCK)
 		lock_sock(sk);
 
-	/* Check these errors (active socket, double bind). */
+	/* 基本错误检查：套接字必须处于未连接且未被已有端口占用 */
 	err = -EINVAL;
 	if (sk->sk_state != TCP_CLOSE || inet->inet_num)
 		goto out_release_sock;
 
+	/* 设置接收/发送地址（网络字节序） */
 	inet->inet_rcv_saddr = inet->inet_saddr = addr->sin_addr.s_addr;
+	/* 如果是多播或广播地址，发送地址设为 0，表示使用设备地址发送 */
 	if (chk_addr_ret == RTN_MULTICAST || chk_addr_ret == RTN_BROADCAST)
 		inet->inet_saddr = 0;  /* Use device */
 
-	/* Make sure we are allowed to bind here. */
+	/*
+	 * 如果指定了端口，或套接字未设置“地址无端口”标志，
+	 * 尝试通过协议层分配/验证端口（get_port），并运行 BPF post-bind（如有）
+	 */
 	if (snum || !(inet_test_bit(BIND_ADDRESS_NO_PORT, sk) ||
 		      (flags & BIND_FORCE_ADDRESS_NO_PORT))) {
 		err = sk->sk_prot->get_port(sk, snum);
 		if (err) {
+			/* 失败时恢复地址为 0 并返回错误 */
 			inet->inet_saddr = inet->inet_rcv_saddr = 0;
 			goto out_release_sock;
 		}
+		/* 如果不是从 BPF 发起的绑定，运行 cgroup 的 post-bind 程序 */
 		if (!(flags & BIND_FROM_BPF)) {
 			err = BPF_CGROUP_RUN_PROG_INET4_POST_BIND(sk);
 			if (err) {
+				/* 出错时撤销端口与地址设置 */
 				inet->inet_saddr = inet->inet_rcv_saddr = 0;
 				if (sk->sk_prot->put_port)
 					sk->sk_prot->put_port(sk);
@@ -551,16 +591,25 @@ int __inet_bind(struct sock *sk, struct sockaddr_unsized *uaddr, int addr_len,
 		}
 	}
 
+	/* 如果成功绑定了接收地址，记录用户锁（防止自动改地址） */
 	if (inet->inet_rcv_saddr)
 		sk->sk_userlocks |= SOCK_BINDADDR_LOCK;
+	/* 如果绑定了端口，设置端口锁位 */
 	if (snum)
 		sk->sk_userlocks |= SOCK_BINDPORT_LOCK;
+
+	/* 将端口转换为网络字节序并保存 */
 	inet->inet_sport = htons(inet->inet_num);
+	/* 清除对端地址/端口（绑定后仍未连接） */
 	inet->inet_daddr = 0;
 	inet->inet_dport = 0;
+	/* 重置目的地缓存（route/dst），以便后续路由重建使用新的本地地址 */
 	sk_dst_reset(sk);
+
+	/* 成功 */
 	err = 0;
 out_release_sock:
+	/* 如果之前加了锁，则释放 */
 	if (flags & BIND_WITH_LOCK)
 		release_sock(sk);
 out:
@@ -1057,38 +1106,44 @@ static int inet_compat_ioctl(struct socket *sock, unsigned int cmd, unsigned lon
 }
 #endif /* CONFIG_COMPAT */
 
+/*
+ * inet_stream_ops - IPv4流式套接字（TCP）的系统调用操作函数表
+ * 
+ * 该结构体定义了TCP套接字的所有系统调用实现函数指针，
+ * 当用户程序对TCP套接字进行系统调用时，内核会调用对应的函数。
+ */
 const struct proto_ops inet_stream_ops = {
-	.family		   = PF_INET,
-	.owner		   = THIS_MODULE,
-	.release	   = inet_release,
-	.bind		   = inet_bind,
-	.connect	   = inet_stream_connect,
-	.socketpair	   = sock_no_socketpair,
-	.accept		   = inet_accept,
-	.getname	   = inet_getname,
-	.poll		   = tcp_poll,
-	.ioctl		   = inet_ioctl,
-	.gettstamp	   = sock_gettstamp,
-	.listen		   = inet_listen,
-	.shutdown	   = inet_shutdown,
-	.setsockopt	   = sock_common_setsockopt,
-	.getsockopt	   = sock_common_getsockopt,
-	.sendmsg	   = inet_sendmsg,
-	.recvmsg	   = inet_recvmsg,
+	.family		   = PF_INET,		/* 协议族：IPv4 */
+	.owner		   = THIS_MODULE,	/* 模块所有者 */
+	.release	   = inet_release,	/* 套接字释放函数 */
+	.bind		   = inet_bind,		/* 绑定本地地址 */
+	.connect	   = inet_stream_connect,	/* TCP连接建立 */
+	.socketpair	   = sock_no_socketpair,	/* 不支持套接字对（TCP不支持） */
+	.accept		   = inet_accept,		/* 接受连接请求 */
+	.getname	   = inet_getname,	/* 获取本地或远程地址 */
+	.poll		   = tcp_poll,		/* 轮询套接字状态 */
+	.ioctl		   = inet_ioctl,		/* IO控制操作 */
+	.gettstamp	   = sock_gettstamp,	/* 获取时间戳 */
+	.listen		   = inet_listen,		/* 监听连接请求 */
+	.shutdown	   = inet_shutdown,	/* 关闭套接字 */
+	.setsockopt	   = sock_common_setsockopt,	/* 设置套接字选项 */
+	.getsockopt	   = sock_common_getsockopt,	/* 获取套接字选项 */
+	.sendmsg	   = inet_sendmsg,	/* 发送消息 */
+	.recvmsg	   = inet_recvmsg,	/* 接收消息 */
 #ifdef CONFIG_MMU
-	.mmap		   = tcp_mmap,
+	.mmap		   = tcp_mmap,		/* 内存映射（需要MMU支持） */
 #endif
-	.splice_eof	   = inet_splice_eof,
-	.splice_read	   = tcp_splice_read,
-	.set_peek_off      = sk_set_peek_off,
-	.read_sock	   = tcp_read_sock,
-	.read_skb	   = tcp_read_skb,
-	.sendmsg_locked    = tcp_sendmsg_locked,
-	.peek_len	   = tcp_peek_len,
+	.splice_eof	   = inet_splice_eof,	/* 拼接EOF处理 */
+	.splice_read	   = tcp_splice_read,	/* TCP数据拼接读取 */
+	.set_peek_off      = sk_set_peek_off,	/* 设置peek偏移量 */
+	.read_sock	   = tcp_read_sock,	/* 从套接字读取数据 */
+	.read_skb	   = tcp_read_skb,	/* 从SKB读取数据 */
+	.sendmsg_locked    = tcp_sendmsg_locked,	/* 锁定状态发送消息 */
+	.peek_len	   = tcp_peek_len,	/* 获取可peek的数据长度 */
 #ifdef CONFIG_COMPAT
-	.compat_ioctl	   = inet_compat_ioctl,
+	.compat_ioctl	   = inet_compat_ioctl,	/* 兼容性IO控制（32位兼容） */
 #endif
-	.set_rcvlowat	   = tcp_set_rcvlowat,
+	.set_rcvlowat	   = tcp_set_rcvlowat,	/* 设置接收低水位标记 */
 };
 EXPORT_SYMBOL(inet_stream_ops);
 
@@ -1148,7 +1203,7 @@ static const struct proto_ops inet_sockraw_ops = {
 	.compat_ioctl	   = inet_compat_ioctl,
 #endif
 };
-
+// 注册协议族
 static const struct net_proto_family inet_family_ops = {
 	.family = PF_INET,
 	.create = inet_create,
@@ -1158,39 +1213,52 @@ static const struct net_proto_family inet_family_ops = {
 /* Upon startup we insert all the elements in inetsw_array[] into
  * the linked list inetsw.
  */
+/*
+ * inetsw_array - IPv4协议族的协议处理程序注册数组
+ * 
+ * 该数组定义了系统支持的IPv4协议类型和对应的处理程序。
+ * 在系统启动时，这些条目会被注册到inetsw链表中，供socket系统调用查找使用。
+ * 每个条目包含套接字类型、协议号、协议操作函数表和标志位。
+ * 
+ * inetsw数组地址偏移得到 struct inet_protosw 结构体
+ */
 static struct inet_protosw inetsw_array[] =
 {
+	/* TCP协议：面向连接的可靠字节流通信 */
 	{
-		.type =       SOCK_STREAM,
-		.protocol =   IPPROTO_TCP,
-		.prot =       &tcp_prot,
-		.ops =        &inet_stream_ops,
-		.flags =      INET_PROTOSW_PERMANENT |
-			      INET_PROTOSW_ICSK,
+		.type =       SOCK_STREAM,	/* 流式套接字，提供可靠的、有序的、双向的字节流 */
+		.protocol =   IPPROTO_TCP,	/* TCP传输控制协议 */
+		.prot =       &tcp_prot,	/* TCP协议核心操作函数表（连接管理、数据传输等） */
+		.ops =        &inet_stream_ops,	/* 流式套接字系统调用实现（bind、connect、accept等） */
+		.flags =      INET_PROTOSW_PERMANENT |	/* 永久协议，不可卸载 */
+			      INET_PROTOSW_ICSK,	/* 使用inet_connection_sock结构（面向连接） */
 	},
 
+	/* UDP协议：无连接的不可靠数据报通信 */
 	{
-		.type =       SOCK_DGRAM,
-		.protocol =   IPPROTO_UDP,
-		.prot =       &udp_prot,
-		.ops =        &inet_dgram_ops,
-		.flags =      INET_PROTOSW_PERMANENT,
+		.type =       SOCK_DGRAM,	/* 数据报套接字，提供无连接的、不可靠的数据报服务 */
+		.protocol =   IPPROTO_UDP,	/* UDP用户数据报协议 */
+		.prot =       &udp_prot,	/* UDP协议核心操作函数表 */
+		.ops =        &inet_dgram_ops,	/* 数据报套接字系统调用实现 */
+		.flags =      INET_PROTOSW_PERMANENT,	/* 永久协议，核心网络功能 */
        },
 
+       /* ICMP协议：用于网络诊断和控制消息（如ping） */
        {
-		.type =       SOCK_DGRAM,
-		.protocol =   IPPROTO_ICMP,
-		.prot =       &ping_prot,
-		.ops =        &inet_sockraw_ops,
-		.flags =      INET_PROTOSW_REUSE,
+		.type =       SOCK_DGRAM,	/* 数据报套接字类型 */
+		.protocol =   IPPROTO_ICMP,	/* ICMP互联网控制消息协议 */
+		.prot =       &ping_prot,	/* ping协议操作函数表 */
+		.ops =        &inet_sockraw_ops,	/* 使用原始套接字操作进行特殊处理 */
+		.flags =      INET_PROTOSW_REUSE,	/* 支持端口重用 */
        },
 
+       /* RAW协议：提供原始IP数据包访问能力 */
        {
-	       .type =       SOCK_RAW,
-	       .protocol =   IPPROTO_IP,	/* wild card */
-	       .prot =       &raw_prot,
-	       .ops =        &inet_sockraw_ops,
-	       .flags =      INET_PROTOSW_REUSE,
+	       .type =       SOCK_RAW,	/* 原始套接字，可以直接访问IP层数据包 */
+	       .protocol =   IPPROTO_IP,	/* IP协议通配符，匹配所有IP协议 */
+	       .prot =       &raw_prot,	/* RAW协议操作函数表 */
+	       .ops =        &inet_sockraw_ops,	/* 原始套接字系统调用实现 */
+	       .flags =      INET_PROTOSW_REUSE,	/* 支持端口重用 */
        }
 };
 
@@ -1917,7 +1985,7 @@ static int __init inet_init(void)
 	/*
 	 *	Tell SOCKET that we are alive...
 	 */
-
+	// 注册协议族
 	(void)sock_register(&inet_family_ops);
 
 #ifdef CONFIG_SYSCTL

@@ -224,7 +224,7 @@ static const char * const pf_family_names[] = {
 /*
  *	The protocol list. Each protocol is registered in here.
  */
-
+// 系统初始化时调用
 static DEFINE_SPINLOCK(net_family_lock);
 static const struct net_proto_family __rcu *net_families[NPROTO] __read_mostly;
 
@@ -473,51 +473,85 @@ static struct file_system_type sock_fs_type = {
  *	This function uses GFP_KERNEL internally.
  */
 
+/*
+ * sock_alloc_file - 为套接字分配文件结构体
+ * @sock: 套接字结构体指针
+ * @flags: 文件标志位
+ * @dname: 调试名称（可为NULL，使用协议名称）
+ * 
+ * 返回值: 成功返回文件结构体指针，失败返回ERR指针
+ * 
+ * 该函数为套接字创建对应的文件结构体，建立套接字与文件系统的关联。
+ * 如果分配失败，会自动释放套接字资源。函数内部使用GFP_KERNEL内存分配标志。
+ */
 struct file *sock_alloc_file(struct socket *sock, int flags, const char *dname)
 {
 	struct file *file;
 
+	/* 如果没有提供调试名称，使用协议创建者的名称或空字符串 */
 	if (!dname)
 		dname = sock->sk ? sock->sk->sk_prot_creator->name : "";
 
+	/* 分配伪文件结构体，关联套接字inode和套接字文件系统挂载点 */
 	file = alloc_file_pseudo(SOCK_INODE(sock), sock_mnt, dname,
 				O_RDWR | (flags & O_NONBLOCK),
 				&socket_file_ops);
+	/* 如果文件分配失败，释放套接字资源并返回错误 */
 	if (IS_ERR(file)) {
 		sock_release(sock);
 		return file;
 	}
 
+	/* 设置文件模式标志，启用非阻塞I/O优化 */
 	file->f_mode |= FMODE_NOWAIT;
+	/* 建立套接字与文件的双向关联 */
 	sock->file = file;
 	file->private_data = sock;
+	/* 打开流式文件，设置文件位置和操作 */
 	stream_open(SOCK_INODE(sock), file);
 	/*
-	 * Disable permission and pre-content events, but enable legacy
-	 * inotify events for legacy users.
+	 * 禁用权限和内容前事件，但为遗留用户启用传统的inotify事件
+	 * 这优化了套接字文件的通知机制，避免不必要的性能开销
 	 */
 	file_set_fsnotify_mode(file, FMODE_NONOTIFY_PERM);
 	return file;
 }
 EXPORT_SYMBOL(sock_alloc_file);
 
+/*
+ * sock_map_fd - 将套接字映射到文件描述符
+ * @sock: 已创建的套接字结构体指针
+ * @flags: 文件描述符标志位 (O_CLOEXEC, O_NONBLOCK等)
+ * 
+ * 返回值: 成功返回文件描述符，失败返回错误码
+ * 
+ * 该函数是套接字创建流程的关键步骤，负责将内核中的套接字对象
+ * 映射到用户空间可访问的文件描述符，实现UNIX"一切皆文件"的设计哲学
+ * 应用层通过fd，找到对应的套接字结构体
+ */
 static int sock_map_fd(struct socket *sock, int flags)
 {
 	struct file *newfile;
+	/* 获取未使用的文件描述符，并设置指定的标志位 */
 	int fd = get_unused_fd_flags(flags);
+	/* 如果获取文件描述符失败，需要释放套接字资源 */
 	if (unlikely(fd < 0)) {
 		sock_release(sock);
-		return fd;
+		return fd;	/* 返回错误码 */
 	}
 
+	/* 为套接字创建对应的文件结构体 */
 	newfile = sock_alloc_file(sock, flags, NULL);
+	/* 如果文件创建成功，将文件安装到文件描述符表中 */
 	if (!IS_ERR(newfile)) {
+		// 建立应用层fd和内核socket的关联
 		fd_install(fd, newfile);
-		return fd;
+		return fd;	/* 返回有效的文件描述符 */
 	}
 
+	/* 文件创建失败，释放之前获取的文件描述符 */
 	put_unused_fd(fd);
-	return PTR_ERR(newfile);
+	return PTR_ERR(newfile);	/* 返回文件创建的错误码 */
 }
 
 /**
@@ -1531,6 +1565,20 @@ EXPORT_SYMBOL(sock_wake_async);
  *	This function internally uses GFP_KERNEL.
  */
 
+/*
+ * __sock_create - 创建套接字的核心实现函数
+ * @net: 网络命名空间
+ * @family: 协议族 (AF_INET, AF_UNIX等)
+ * @type: 通信类型 (SOCK_STREAM, SOCK_DGRAM等)
+ * @protocol: 具体协议 (通常为0，表示使用默认协议)
+ * @res: 输出参数，指向新创建的套接字指针
+ * @kern: 布尔值，表示是否为内核空间套接字
+ * 
+ * 返回值: 成功返回0，失败返回错误码。失败时@res设置为NULL
+ * 
+ * 该函数是套接字创建的核心实现，负责分配套接字结构体、加载协议模块、
+ * 调用协议特定的创建函数，并通过LSM安全检查
+ */
 int __sock_create(struct net *net, int family, int type, int protocol,
 			 struct socket **res, int kern)
 {
@@ -1539,17 +1587,15 @@ int __sock_create(struct net *net, int family, int type, int protocol,
 	const struct net_proto_family *pf;
 
 	/*
-	 *      Check protocol is in range
+	 * 检查协议族和套接字类型是否在有效范围内
 	 */
 	if (family < 0 || family >= NPROTO)
 		return -EAFNOSUPPORT;
 	if (type < 0 || type >= SOCK_MAX)
 		return -EINVAL;
 
-	/* Compatibility.
-
-	   This uglymoron is moved from INET layer to here to avoid
-	   deadlock in module load.
+	/* 兼容性处理：将过时的PF_INET+SOCK_PACKET组合转换为PF_PACKET
+	 * 这个处理从INET层移到这里是为了避免模块加载时的死锁问题
 	 */
 	if (family == PF_INET && type == SOCK_PACKET) {
 		pr_info_once("%s uses obsolete (PF_INET,SOCK_PACKET)\n",
@@ -1557,55 +1603,57 @@ int __sock_create(struct net *net, int family, int type, int protocol,
 		family = PF_PACKET;
 	}
 
+	/* LSM安全检查：在套接字创建前进行权限检查 */
 	err = security_socket_create(family, type, protocol, kern);
 	if (err)
 		return err;
 
 	/*
-	 *	Allocate the socket and allow the family to set things up. if
-	 *	the protocol is 0, the family is instructed to select an appropriate
-	 *	default.
+	 * 分配套接字结构体，允许协议族进行初始化设置
+	 * 如果protocol为0，协议族会选择适当的默认协议
 	 */
 	sock = sock_alloc();
 	if (!sock) {
 		net_warn_ratelimited("socket: no more sockets\n");
-		return -ENFILE;	/* Not exactly a match, but its the
-				   closest posix thing */
+		return -ENFILE;	/* 虽然不是完全匹配，但这是最接近的POSIX错误码 */
 	}
 
 	sock->type = type;
 
 #ifdef CONFIG_MODULES
-	/* Attempt to load a protocol module if the find failed.
-	 *
-	 * 12/09/1996 Marcin: But! this makes REALLY only sense, if the user
-	 * requested real, full-featured networking support upon configuration.
-	 * Otherwise module support will break!
+	/* 如果找不到对应的协议族，尝试加载协议模块
+	 * 
+	 * 注意：这只有在用户配置时请求了完整网络支持时才真正有意义
+	 * 否则模块支持可能会出现问题
 	 */
 	if (rcu_access_pointer(net_families[family]) == NULL)
 		request_module("net-pf-%d", family);
 #endif
 
+	/* 在RCU读锁保护下查找对应的协议族 */
 	rcu_read_lock();
+	// 1.找到协议族的操作函数指针
 	pf = rcu_dereference(net_families[family]);
 	err = -EAFNOSUPPORT;
 	if (!pf)
 		goto out_release;
 
 	/*
-	 * We will call the ->create function, that possibly is in a loadable
-	 * module, so we have to bump that loadable module refcnt first.
+	 * 将要调用协议族的->create函数，该函数可能位于可加载模块中
+	 * 因此需要先增加该模块的引用计数，防止在调用过程中模块被卸载
 	 */
 	if (!try_module_get(pf->owner))
 		goto out_release;
 
-	/* Now protected by module ref count */
+	/* 现在受到模块引用计数的保护，可以安全地释放RCU读锁 */
 	rcu_read_unlock();
 
+	/* 调用协议族特定的创建函数来初始化套接字 */
+	// 执行af_inet.c中的inet_create函数
 	err = pf->create(net, sock, protocol, kern);
 	if (err < 0) {
-		/* ->create should release the allocated sock->sk object on error
-		 * and make sure sock->sk is set to NULL to avoid use-after-free
+		/* ->create函数在出错时应释放已分配的sock->sk对象
+		 * 并确保sock->sk设置为NULL以避免use-after-free
 		 */
 		DEBUG_NET_WARN_ONCE(sock->sk,
 				    "%ps must clear sock->sk on failure, family: %d, type: %d, protocol: %d\n",
@@ -1614,17 +1662,18 @@ int __sock_create(struct net *net, int family, int type, int protocol,
 	}
 
 	/*
-	 * Now to bump the refcnt of the [loadable] module that owns this
-	 * socket at sock_release time we decrement its refcnt.
+	 * 增加拥有此套接字的[可加载]模块的引用计数
+	 * 在sock_release时会减少其引用计数
 	 */
 	if (!try_module_get(sock->ops->owner))
 		goto out_module_busy;
 
 	/*
-	 * Now that we're done with the ->create function, the [loadable]
-	 * module can have its refcnt decremented
+	 * 现在我们已经完成了->create函数的调用
+	 * 可以减少[可加载]模块的引用计数
 	 */
 	module_put(pf->owner);
+	/* LSM后创建安全检查 */
 	err = security_socket_post_create(sock, family, type, protocol, kern);
 	if (err)
 		goto out_sock_release;
@@ -1739,20 +1788,36 @@ __weak noinline int update_socket_protocol(int family, int type, int protocol)
 
 __bpf_hook_end();
 
+/*
+ * __sys_socket - 系统调用socket的核心实现函数
+ * @family: 协议族 (如AF_INET, AF_UNIX等)
+ * @type: 套接字类型 (如SOCK_STREAM, SOCK_DGRAM等)
+ * @protocol: 具体协议 (通常为0，表示使用默认协议)
+ * 
+ * 返回值: 成功返回文件描述符，失败返回错误码
+ * 
+ * 该函数是socket系统调用的核心实现，负责创建新的套接字并返回对应的文件描述符
+ */
 int __sys_socket(int family, int type, int protocol)
 {
+	// 给用户层传递的，和文件系统相管理
 	struct socket *sock;
+	// struct sock *sk  给底层传递
 	int flags;
 
+	/* 调用__sys_socket_create创建套接字结构体 */
 	sock = __sys_socket_create(family, type,
 				   update_socket_protocol(family, type, protocol));
 	if (IS_ERR(sock))
 		return PTR_ERR(sock);
 
+	/* 从type参数中提取标志位，清除套接字类型位 */
 	flags = type & ~SOCK_TYPE_MASK;
+	/* 处理非阻塞标志的兼容性转换 */
 	if (SOCK_NONBLOCK != O_NONBLOCK && (flags & SOCK_NONBLOCK))
 		flags = (flags & ~SOCK_NONBLOCK) | O_NONBLOCK;
 
+	/* 将套接字映射到文件描述符，只保留O_CLOEXEC和O_NONBLOCK标志 */
 	return sock_map_fd(sock, flags & (O_CLOEXEC | O_NONBLOCK));
 }
 
@@ -1871,6 +1936,7 @@ int __sys_bind_socket(struct socket *sock, struct sockaddr_storage *address,
 	err = security_socket_bind(sock, (struct sockaddr *)address,
 				   addrlen);
 	if (!err)
+		// 调用net/ipv4/af_inet.c 中的inetsw_array .ops =        &inet_stream_ops,
 		err = READ_ONCE(sock->ops)->bind(sock,
 						 (struct sockaddr_unsized *)address,
 						 addrlen);
@@ -1885,23 +1951,39 @@ int __sys_bind_socket(struct socket *sock, struct sockaddr_storage *address,
  *	the protocol layer (having also checked the address is ok).
  */
 
+/*
+ * __sys_bind - bind系统调用的核心实现函数
+ * @fd: 文件描述符，指向要绑定的套接字
+ * @umyaddr: 用户空间地址结构体指针，包含要绑定的地址信息
+ * @addrlen: 地址结构体的长度
+ * 
+ * 返回值: 成功返回0，失败返回错误码
+ * 
+ * 该函数是bind系统调用的核心实现，负责将套接字绑定到指定的本地地址。
+ * 主要工作包括：验证文件描述符、获取套接字对象、将用户空间地址复制到内核空间，
+ * 然后调用协议特定的绑定函数。
+ */
 int __sys_bind(int fd, struct sockaddr __user *umyaddr, int addrlen)
 {
 	struct socket *sock;
-	struct sockaddr_storage address;
-	CLASS(fd, f)(fd);
+	struct sockaddr_storage address;	/* 内核空间地址存储缓冲区 */
+	CLASS(fd, f)(fd);	/* 文件描述符分类宏，用于类型检查 */
 	int err;
 
+	/* 检查文件描述符是否有效 */
 	if (fd_empty(f))
-		return -EBADF;
+		return -EBADF;	/* 错误的文件描述符 */
+	/* 从文件描述符获取套接字对象 */
 	sock = sock_from_file(fd_file(f));
 	if (unlikely(!sock))
-		return -ENOTSOCK;
+		return -ENOTSOCK;	/* 不是套接字文件描述符 */
 
+	/* 将用户空间地址复制到内核空间缓冲区 */
 	err = move_addr_to_kernel(umyaddr, addrlen, &address);
 	if (unlikely(err))
-		return err;
+		return err;	/* 地址复制失败 */
 
+	/* 调用实际的套接字绑定函数 */
 	return __sys_bind_socket(sock, &address, addrlen);
 }
 
@@ -3208,25 +3290,39 @@ SYSCALL_DEFINE2(socketcall, int, call, unsigned long __user *, args)
  *	socket interface. The value ops->family corresponds to the
  *	socket system call protocol family.
  */
+/*
+ * sock_register - 注册套接字协议族处理程序
+ * @ops: 协议族描述结构体指针
+ * 
+ * 返回值: 成功返回0，失败返回错误码
+ * 
+ * 该函数由协议处理程序调用，用于向内核注册其地址族，并将其链接到套接字接口中。
+ * ops->family的值对应于socket系统调用的协议族参数。
+ */
 int sock_register(const struct net_proto_family *ops)
 {
 	int err;
 
+	/* 检查协议族编号是否在有效范围内 */
 	if (ops->family >= NPROTO) {
 		pr_crit("protocol %d >= NPROTO(%d)\n", ops->family, NPROTO);
 		return -ENOBUFS;
 	}
 
+	/* 获取协议族注册表的自旋锁，确保并发安全 */
 	spin_lock(&net_family_lock);
+	/* 检查该协议族是否已经被注册 */
 	if (rcu_dereference_protected(net_families[ops->family],
 				      lockdep_is_held(&net_family_lock)))
-		err = -EEXIST;
+		err = -EEXIST;	/* 协议族已存在，返回错误 */
 	else {
+		/* 使用RCU安全地分配协议族处理程序指针 */
 		rcu_assign_pointer(net_families[ops->family], ops);
-		err = 0;
+		err = 0;	/* 注册成功 */
 	}
 	spin_unlock(&net_family_lock);
 
+	/* 输出注册成功的日志信息 */
 	pr_info("NET: Registered %s protocol family\n", pf_family_names[ops->family]);
 	return err;
 }
